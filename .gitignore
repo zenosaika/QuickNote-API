@@ -178,3 +178,6 @@ cython_debug/
 
 # sqlite3
 *.db
+
+# fly.io
+*fly.toml

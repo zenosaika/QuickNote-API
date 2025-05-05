@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, status, Depends, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_users import FastAPIUsers
 from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
@@ -21,6 +22,11 @@ from models import User, Transcription
 import schemas
 from security import auth_backend
 
+import io
+import re
+from markdown_pdf import MarkdownPdf, Section
+from md2docx_python.src.md2docx_python import markdown_to_word
+
 from google import genai
 from google.genai import types
 
@@ -36,6 +42,7 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 async def lifespan(app: FastAPI):
     logger.info("Lifespan event: Initializing database...")
     os.makedirs("temp_audio", exist_ok=True)
+    os.makedirs("temp_document", exist_ok=True)
     logger.info("Lifespan event: Temp directory checked/created.")
     await create_db_and_tables()
     logger.info("Lifespan event: Database setup complete.")
@@ -402,6 +409,128 @@ async def get_transcription_detail(
     return response_data
 
 
+@app.get("/api/transcription/{transcription_id}/export/pdf", tags=["transcription"], summary="Export summary as PDF")
+async def export_summary_pdf(
+    transcription_id: uuid.UUID,
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    logger.info(f"Attempting PDF export for transcription {transcription_id} by user {user.id}")
+
+    query = select(Transcription).where(Transcription.id == transcription_id)
+    result = await session.execute(query)
+    db_transcription = result.scalar_one_or_none()
+
+    if db_transcription is None:
+        logger.warning(f"PDF export failed: Transcription {transcription_id} not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Transcription not found")
+
+    if db_transcription.user_id != user.id:
+        logger.warning(f"PDF export unauthorized: User {user.id} attempted access to transcription {transcription_id}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Not authorized to export this transcription")
+
+    summary_text = db_transcription.summarized_text
+
+    if not summary_text or not summary_text.strip():
+        logger.info(f"PDF export requested for transcription {transcription_id} but no summary available.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="No summary available for this transcription.")
+
+    try:
+        pdf = MarkdownPdf(toc_level=2, optimize=True)
+        pdf.add_section(Section(summary_text, toc=False))
+
+        pdf_buffer = io.BytesIO()
+        pdf.save(pdf_buffer)
+        pdf_buffer.seek(0)
+
+        filename = f"{db_transcription.filename.rsplit('.', 1)[0] if '.' in db_transcription.filename else db_transcription.filename}_summary.pdf"
+
+        logger.info(f"PDF generated successfully for transcription {transcription_id}.")
+
+        return StreamingResponse(
+            pdf_buffer,
+            media_type="application/pdf",
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"'
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating PDF for transcription {transcription_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate PDF.")
+
+
+@app.get("/api/transcription/{transcription_id}/export/docx", tags=["transcription"], summary="Export summary as DOCX")
+async def export_summary_docx(
+    transcription_id: uuid.UUID,
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    logger.info(f"Attempting DOCX export for transcription {transcription_id} by user {user.id}")
+
+    query = select(Transcription).where(Transcription.id == transcription_id)
+    result = await session.execute(query)
+    db_transcription = result.scalar_one_or_none()
+
+    if db_transcription is None:
+        logger.warning(f"DOCX export failed: Transcription {transcription_id} not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Transcription not found")
+
+    if db_transcription.user_id != user.id:
+        logger.warning(f"DOCX export unauthorized: User {user.id} attempted access to transcription {transcription_id}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Not authorized to export this transcription")
+
+    summary_text = db_transcription.summarized_text
+
+    if not summary_text or not summary_text.strip():
+        logger.info(f"DOCX export requested for transcription {transcription_id} but no summary available.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="No summary available for this transcription.")
+
+    try:
+        temp_id = str(db_transcription.id)
+        temp_md_file = f'temp_document/{temp_id}.md'
+        temp_docx_file = f'temp_document/{temp_id}.docx'
+
+        summary_text = re.sub(r"(^\s*)\*\s", r"\1- ", summary_text, flags=re.MULTILINE)
+
+        with open(temp_md_file, 'w', encoding='utf-8') as f:
+            f.write(summary_text)
+
+        markdown_to_word(temp_md_file, temp_docx_file)
+        
+        docx_buffer = io.BytesIO()
+        with open(temp_docx_file, 'rb') as temp_file_handle:
+             docx_buffer.write(temp_file_handle.read())
+        docx_buffer.seek(0)
+
+        if os.path.exists(temp_md_file):
+            os.remove(temp_md_file)
+        if os.path.exists(temp_docx_file):
+            os.remove(temp_docx_file)
+
+        filename = f"{db_transcription.filename.rsplit('.', 1)[0] if '.' in db_transcription.filename else db_transcription.filename}_summary.docx"
+
+        logger.info(f"DOCX generated successfully for transcription {transcription_id}.")
+
+        return StreamingResponse(
+            docx_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"'
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating DOCX for transcription {transcription_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate DOCX.")
+
+
 @app.delete("/api/transcription/{transcription_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["transcription"])
 async def delete_transcription(
     transcription_id: uuid.UUID, user: User = Depends(current_active_user),
@@ -431,6 +560,6 @@ async def delete_transcription(
 @app.get("/")
 async def read_root(): return {"message": "Welcome to the QuickNote Transcription and Summarization API"}
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000,
-                reload=True, timeout_keep_alive=120)
+# if __name__ == "__main__":
+#     uvicorn.run("main:app", host="0.0.0.0", port=8000,
+#                 reload=True, timeout_keep_alive=120)

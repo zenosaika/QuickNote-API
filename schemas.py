@@ -16,10 +16,10 @@ class UserUpdate(schemas.BaseUserUpdate):
 
 
 class TranscriptionSegment(BaseModel):
-    start_time: str
-    end_time: str
-    speaker_id: int
-    transcript: str
+    start_timestamp: str
+    end_timestamp: str
+    speaker_id: str
+    text_transcript: str
 
 
 class TranscriptionSegments(BaseModel):

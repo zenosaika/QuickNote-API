@@ -10,12 +10,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 import os
-import shutil
 import logging
-import uvicorn
 import json
 import uuid
 from typing import List, Optional, Dict, Any
+
+import pydub
+import math
+import tempfile
+
+from urllib.parse import quote
+
+from fastapi.concurrency import run_in_threadpool
+import asyncio
 
 from database import create_db_and_tables, get_async_session
 from models import User, Transcription
@@ -36,6 +43,10 @@ load_dotenv()
 
 model = "gemini-2.5-flash-preview-04-17"
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+
+# Maximum duration for audio chunks
+MAX_API_CHUNK_DURATION_MS = 30 * 60 * 1000 # 30 minutes
 
 
 @asynccontextmanager
@@ -96,9 +107,9 @@ app = FastAPI(
 )
 
 
-# origins = ["http://localhost:3000", 
-#            "http://127.0.0.1:3000"]
-origins = ['https://quicknote-g6ic.onrender.com']
+origins = ["http://localhost:3000", 
+           "http://127.0.0.1:3000",
+           "https://quicknote-g6ic.onrender.com"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -108,10 +119,46 @@ app.add_middleware(
 )
 
 
+def parse_mm_ss_s(ts_string):
+    ts_string = ts_string.rstrip('s')
+    parts = ts_string.split(':')
+    minutes = float(parts[0])
+    seconds = float(parts[1])
+    return minutes * 60 + seconds
+
+
+def format_seconds_to_mm_ss(seconds):
+    if seconds < 0:
+        seconds = 0
+    minutes = int(seconds // 60)
+    remaining_seconds = int(seconds % 60)
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
+def get_fixed_duration_segment_boundaries(
+    total_duration_ms,
+    max_segment_duration_ms
+):
+    if total_duration_ms == 0 or max_segment_duration_ms <= 0:
+        return []
+
+    num_chunks = math.ceil(total_duration_ms / max_segment_duration_ms)
+    segments_ms = []
+    for i in range(num_chunks):
+        start_ms = i * max_segment_duration_ms
+        end_ms = min((i + 1) * max_segment_duration_ms, total_duration_ms)
+        if end_ms > start_ms + 50:
+             segments_ms.append([start_ms, end_ms])
+        else:
+            logger.debug(f"Skipping tiny fixed segment: {start_ms/1000:.2f}s - {end_ms/1000:.2f}s")
+
+    logger.info(f"Generated {len(segments_ms)} fixed-duration segments.")
+    return segments_ms
+
+
 async def generate_transcription(path_to_audio_file):
-    files = [
-        client.files.upload(file=path_to_audio_file),
-    ]
+    uploaded_file = await run_in_threadpool(client.files.upload, file=path_to_audio_file)
+    files = [uploaded_file]
 
     contents = [
         types.Content(
@@ -121,14 +168,7 @@ async def generate_transcription(path_to_audio_file):
                     file_uri=files[0].uri,
                     mime_type=files[0].mime_type,
                 ),
-                types.Part.from_text(text="""**Prompt:**
-
-Please transcribe the provided audio file. Your task is to generate a detailed transcription that includes the spoken text, timestamps for the start and end of each speech segment, and speaker diarization (identifying different speakers).
-
-**Instructions:**
-1.  **Transcribe:** Accurately convert all spoken words into text.
-2.  **Timestamp:** For each distinct speech segment, provide the start time and end time in format `HH:MM:SS` (e.g., `00:01:23` for 1 minute and 23 seconds).
-3.  **Diarize:** Assign a unique identifier (e.g., 1, 2, 3) to each speaker detected in the audio. Maintain consistency in speaker IDs throughout the transcription."""),
+                types.Part.from_text(text="""Please transcribe the provided audio file. Your task is to generate a detailed transcription that includes the spoken text, timestamps for the start and end of each speech segment (using timestamps of the form MM:SS), and speaker diarization (identifying different speakers; speaker IDs start from 1)."""),
             ],
         ),
     ]
@@ -143,19 +183,19 @@ Please transcribe the provided audio file. Your task is to generate a detailed t
                     type=genai.types.Type.ARRAY,
                     items=genai.types.Schema(
                         type=genai.types.Type.OBJECT,
-                        required=["start_time", "end_time",
-                                  "speaker_id", "transcript"],
+                        required=["start_timestamp", "end_timestamp",
+                                  "speaker_id", "text_transcript"],
                         properties={
-                            "start_time": genai.types.Schema(
+                            "start_timestamp": genai.types.Schema(
                                 type=genai.types.Type.STRING,
                             ),
-                            "end_time": genai.types.Schema(
+                            "end_timestamp": genai.types.Schema(
                                 type=genai.types.Type.STRING,
                             ),
                             "speaker_id": genai.types.Schema(
                                 type=genai.types.Type.INTEGER,
                             ),
-                            "transcript": genai.types.Schema(
+                            "text_transcript": genai.types.Schema(
                                 type=genai.types.Type.STRING,
                             ),
                         },
@@ -171,12 +211,18 @@ Please transcribe the provided audio file. Your task is to generate a detailed t
         config=generate_content_config
     )
 
+    try:
+        await run_in_threadpool(client.files.delete, name=files[0].name)
+        logger.info(f"Deleted uploaded file {files[0].name} from Gemini Files API.")
+    except Exception as delete_e:
+        logger.warning(f"Failed to delete file {files[0].name} from Gemini Files API: {delete_e}")
+
     return json.loads("".join(response.text))
 
 
 async def summarize_transcription(transcriptions):
     transcription = '\n'.join(
-        [f'SPEAKER {t["speaker_id"]}: {t["transcript"]}' for t in transcriptions])
+        [f'SPEAKER {t["speaker_id"]}: {t["text_transcript"]}' for t in transcriptions])
 
     contents = [
         types.Content(
@@ -248,10 +294,83 @@ Desired Output Format:
     return json.loads("".join(response.text))
 
 
+async def process_single_audio_chunk(
+    full_audio_segment,
+    start_ms,
+    end_ms,
+    chunk_idx,
+    total_chunks
+):
+    chunk_temp_file_path = None
+    processed_segments = []
+    logger.info(f"  Starting chunk {chunk_idx}/{total_chunks} ({start_ms/1000:.2f}s - {end_ms/1000:.2f}s)")
+
+    try:
+        chunk_audio = full_audio_segment[start_ms:end_ms]
+
+        fd, chunk_temp_file_path = tempfile.mkstemp(suffix=".mp3", dir="temp_audio")
+        os.close(fd)
+
+        logger.debug(f"  Exporting chunk {chunk_idx} to MP3: {chunk_temp_file_path}")
+        await run_in_threadpool(chunk_audio.export, chunk_temp_file_path, format="mp3")
+        logger.debug(f"  Exported chunk {chunk_idx}.")
+
+        logger.debug(f"  Calling transcription API for chunk {chunk_idx}")
+        chunk_result_obj = await generate_transcription(chunk_temp_file_path)
+        chunk_transcription_segments = chunk_result_obj.get("transcriptions", [])
+        logger.debug(f"  API returned {len(chunk_transcription_segments)} segments for chunk {chunk_idx}")
+
+        if 1 <= chunk_idx <= 26:
+            chunk_letter_prefix = chr(ord('A') + chunk_idx - 1)
+        else:
+            logger.warning(
+                f"Chunk index {chunk_idx} is outside the A-Z range (1-26). "
+                f"Using 'Ck{chunk_idx}_' as speaker prefix."
+            )
+            chunk_letter_prefix = f"Ck{chunk_idx}_"
+
+        chunk_start_offset_sec = start_ms / 1000.0
+        for segment in chunk_transcription_segments:
+            try:
+                raw_start_ts = segment.get('start_timestamp', '00:00')
+                raw_end_ts = segment.get('end_timestamp', '00:00')
+                relative_start_sec = parse_mm_ss_s(raw_start_ts)
+                relative_end_sec = parse_mm_ss_s(raw_end_ts)
+                absolute_start_sec = chunk_start_offset_sec + relative_start_sec
+                absolute_end_sec = chunk_start_offset_sec + relative_end_sec
+
+                original_speaker_id_from_api = int(segment.get('speaker_id', 0))
+                new_speaker_id = f"{chunk_letter_prefix}{original_speaker_id_from_api}"
+
+                adjusted_segment = {
+                    'start_timestamp': format_seconds_to_mm_ss(absolute_start_sec),
+                    'end_timestamp': format_seconds_to_mm_ss(absolute_end_sec),
+                    'speaker_id': new_speaker_id,
+                    'text_transcript': str(segment.get('text_transcript', ''))
+                }
+                processed_segments.append(adjusted_segment)
+            except Exception as e:
+                logger.warning(f"  Failed to process individual segment result from API for chunk {chunk_idx}: {segment}. Error: {e}", exc_info=True)
+        
+        logger.info(f"  Finished processing chunk {chunk_idx}/{total_chunks}. Segments found: {len(processed_segments)}")
+        return processed_segments
+
+    except Exception as e:
+        logger.error(f"  Error processing chunk {chunk_idx} ({start_ms/1000:.2f}s - {end_ms/1000:.2f}s): {e}", exc_info=True)
+        raise
+    finally:
+        if chunk_temp_file_path and os.path.exists(chunk_temp_file_path):
+            try:
+                await run_in_threadpool(os.remove, chunk_temp_file_path)
+                logger.debug(f"  Cleaned up chunk temp file for chunk {chunk_idx}: {chunk_temp_file_path}")
+            except OSError as remove_error:
+                logger.error(f"  Error removing chunk temp file {chunk_temp_file_path} for chunk {chunk_idx}: {remove_error}")
+
+
+
 current_active_user = fastapi_users.current_user(active=True)
 
 # API Endpoints
-
 app.include_router(fastapi_users.get_auth_router(
     auth_backend), prefix="/api/auth", tags=["auth"])
 app.include_router(fastapi_users.get_register_router(
@@ -278,31 +397,79 @@ async def transcribe_audio(
     db_transcription = None
     transcription_segments = None
     summarized_text = None
+    all_transcription_results = []
+    full_audio = None
 
     try:
-        # Save file locally
         try:
-            with open(temp_file_path, "wb") as buffer:
-                shutil.copyfileobj(audio_file.file, buffer)
+            content = await audio_file.read()
+            await run_in_threadpool(lambda p, c: open(p, "wb").write(c), temp_file_path, content)
             logger.info(f"User '{user.email}' uploaded file, saved to: {temp_file_path}")
         except Exception as e:
             logger.error(f"Failed to save uploaded file: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Could not save file.")
-        finally:
-            await audio_file.close()
 
-        # Perform Transcription
-        transcription_result_obj = await generate_transcription(temp_file_path)
-        transcription_segments = transcription_result_obj.get("transcriptions")
+        try:
+            logger.info(f"Loading audio from temporary file: {temp_file_path}")
+            full_audio = await run_in_threadpool(pydub.AudioSegment.from_file, temp_file_path)
+            logger.info(f"Audio loaded successfully. Duration: {len(full_audio) / 1000:.2f} seconds.")
+        except pydub.exceptions.CouldntDecodeError as e:
+             logger.error(f"pydub could not decode audio file {temp_file_path}: {e}", exc_info=True)
+             raise HTTPException(status_code=400, detail="Could not decode audio file format.")
+        except FileNotFoundError:
+             logger.error(f"Temporary audio file not found after saving: {temp_file_path}", exc_info=True)
+             raise HTTPException(status_code=500, detail="Internal error: Temporary file not found.")
+        except Exception as e:
+            logger.error(f"Error during audio loading: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Error processing audio file.")
 
-        # Perform Summarization
-        summarization_result_obj = await summarize_transcription(transcription_segments)
+        total_duration_ms = len(full_audio)
+        logger.info("Using fixed-duration splitting.")
+        segment_intervals_ms = get_fixed_duration_segment_boundaries(
+            total_duration_ms,
+            MAX_API_CHUNK_DURATION_MS
+        )
+
+        if not segment_intervals_ms:
+             logger.warning("No audio segments determined for transcription.")
+             all_transcription_results = []
+        else:
+            logger.info(f"Creating {len(segment_intervals_ms)} parallel tasks for audio chunks.")
+            tasks = []
+            for i, (start_ms, end_ms) in enumerate(segment_intervals_ms):
+                tasks.append(process_single_audio_chunk(full_audio, start_ms, end_ms, i + 1, len(segment_intervals_ms)))
+            
+            list_of_chunk_results_or_exceptions = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            processed_chunks_count = 0
+            failed_chunks_count = 0
+            for i, result_or_exc in enumerate(list_of_chunk_results_or_exceptions):
+                if isinstance(result_or_exc, Exception):
+                    logger.error(f"Chunk {i+1}/{len(tasks)} processing failed with exception: {result_or_exc}")
+                    failed_chunks_count += 1
+                elif result_or_exc:
+                    all_transcription_results.extend(result_or_exc)
+                    processed_chunks_count +=1
+                else:
+                    logger.warning(f"Chunk {i+1}/{len(tasks)} returned an unexpected empty or None result.")
+
+
+            logger.info(f"Finished processing all {len(tasks)} chunk tasks. "
+                        f"Successful: {processed_chunks_count}, Failed: {failed_chunks_count}. "
+                        f"Total combined segments: {len(all_transcription_results)}")
+
+            if not all_transcription_results and failed_chunks_count > 0 and processed_chunks_count == 0:
+                raise HTTPException(status_code=500, detail="All audio chunk processing tasks failed.")
+
+            all_transcription_results.sort(key=lambda x: parse_mm_ss_s(x.get('start_timestamp', '00:00')))
+
+        summarization_result_obj = await summarize_transcription(all_transcription_results)
         summarized_text = summarization_result_obj.get("summarize_markdown")
 
         # Save Metadata and Result to Database
         logger.info(f"Saving transcription metadata for user {user.id}...")
         try:
-            transcription_result_json = json.dumps(transcription_segments)
+            transcription_result_json = json.dumps(all_transcription_results)
 
             db_transcription = Transcription(
                 user_id=user.id,
@@ -450,11 +617,14 @@ async def export_summary_pdf(
 
         logger.info(f"PDF generated successfully for transcription {transcription_id}.")
 
+        encoded_filename = quote(filename)
+        content_disposition_header = f"attachment; filename*=UTF-8''{encoded_filename}"
+
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
             headers={
-                'Content-Disposition': f'attachment; filename="{filename}"'
+                'Content-Disposition': content_disposition_header
             }
         )
 
@@ -518,11 +688,14 @@ async def export_summary_docx(
 
         logger.info(f"DOCX generated successfully for transcription {transcription_id}.")
 
+        encoded_filename = quote(filename)
+        content_disposition_header = f"attachment; filename*=UTF-8''{encoded_filename}"
+
         return StreamingResponse(
             docx_buffer,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={
-                'Content-Disposition': f'attachment; filename="{filename}"'
+                'Content-Disposition': content_disposition_header
             }
         )
 
